@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.expo/
+.expo-shared/
+*.log
+.env
+backend/dist/
+backend/.env
+mobile/.expo/
+mobile/dist/
+*.apk
+*.aab
+.DS_Store
+.env.local

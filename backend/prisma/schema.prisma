@@ -1,0 +1,283 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String   @id @default(uuid())
+  email         String   @unique
+  passwordHash  String
+  name          String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  memberships   Membership[]
+  pushTokens    DevicePushToken[]
+}
+
+model Organization {
+  id        String   @id @default(uuid())
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  memberships Membership[]
+  shops       Shop[]
+  customers   Customer[]
+  orders      Order[]
+  confirmationRequests ConfirmationRequest[]
+  whatsappConnections WhatsAppConnection[]
+  shopifyConnections  ShopifyConnection[]
+  webhookEvents WebhookEvent[]
+  auditLogs   AuditLog[]
+  notificationSettings NotificationSetting?
+  messageTemplates MessageTemplate[]
+  devicePushTokens DevicePushToken[]
+}
+
+model Membership {
+  id        String   @id @default(uuid())
+  userId    String
+  orgId     String
+  role      String   @default("owner") // owner, admin, member
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  org       Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  @@unique([userId, orgId])
+  @@index([orgId])
+  @@index([userId])
+}
+
+model Shop {
+  id        String   @id @default(uuid())
+  orgId     String
+  domain    String?  // e.g. myshop.myshopify.com without https
+  name      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  org       Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  shopifyConnection ShopifyConnection?
+  whatsappConnection WhatsAppConnection?
+  customers Customer[]
+  orders    Order[]
+  @@index([orgId])
+}
+
+model ShopifyConnection {
+  id                  String   @id @default(uuid())
+  orgId               String
+  shopId              String   @unique
+  shopDomain          String
+  accessTokenEncrypted String
+  scopes              String[]
+  status              String   @default("connected") // connected, disconnected, error
+  webhookId           String?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+  org                 Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  shop                Shop     @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  @@index([orgId])
+}
+
+model WhatsAppConnection {
+  id                    String   @id @default(uuid())
+  orgId                 String
+  shopId                String?  @unique
+  wabaId                String?
+  phoneNumberId         String?
+  displayPhoneNumber    String?
+  accessTokenEncrypted  String?
+  status                String   @default("connected") // connected, disconnected, pending, error
+  templateStatus        String   @default("unknown") // unknown, approved, pending, rejected
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+  org                   Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  shop                  Shop?    @relation(fields: [shopId], references: [id], onDelete: SetNull)
+  @@index([orgId])
+}
+
+model Customer {
+  id                 String   @id @default(uuid())
+  orgId              String
+  shopId             String
+  shopifyCustomerId  String?
+  phoneE164          String?
+  phoneMasked        String?
+  name               String?
+  email              String?
+  consent            Boolean  @default(false)
+  lastOrderAt        DateTime?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+  org                Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  shop               Shop     @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  orders             Order[]
+  @@index([orgId])
+  @@index([shopId])
+  @@index([phoneE164])
+  @@index([shopifyCustomerId])
+}
+
+model Order {
+  id                  String   @id @default(uuid())
+  orgId               String
+  shopId              String
+  shopifyOrderId      String
+  orderNumber         String?
+  name                String? // e.g. #1001
+  financialStatus     String?
+  fulfillmentStatus   String?
+  totalPrice          Decimal? @db.Decimal(12,2)
+  currency            String?
+  paymentGateway      String?
+  paymentGatewayNames String[]
+  isCod               Boolean  @default(false)
+  confirmationStatus  String   @default("NEW") // NEW, AWAITING_CONFIRMATION, CONFIRMED, CANCEL_REQUESTED, CANCELLED, EXPIRED, FAILED
+  customerId          String?
+  rawPayload          Json?
+  createdAtShopify    DateTime?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+  org                 Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  shop                Shop     @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  customer            Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  confirmationRequests ConfirmationRequest[]
+  @@unique([shopId, shopifyOrderId])
+  @@index([orgId])
+  @@index([shopId])
+  @@index([confirmationStatus])
+  @@index([isCod])
+  @@index([createdAt])
+}
+
+model ConfirmationRequest {
+  id          String   @id @default(uuid())
+  orderId     String
+  orgId       String
+  status      String   @default("NEW") // NEW, AWAITING_CONFIRMATION, CONFIRMED, CANCEL_REQUESTED, CANCELLED, EXPIRED, FAILED
+  expiresAt   DateTime?
+  confirmedAt DateTime?
+  cancelledAt DateTime?
+  reminderCount Int @default(0)
+  lastReminderAt DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  order       Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  org         Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  messageAttempts MessageAttempt[]
+  @@index([orgId])
+  @@index([orderId])
+  @@index([status])
+}
+
+model MessageAttempt {
+  id                    String   @id @default(uuid())
+  confirmationRequestId String
+  templateName          String?
+  toPhone               String
+  status                String   @default("SENT") // SENT, DELIVERED, READ, FAILED
+  waMessageId           String?
+  errorCode             String?
+  errorMessage          String?
+  sentAt                DateTime @default(now())
+  createdAt             DateTime @default(now())
+  confirmationRequest   ConfirmationRequest @relation(fields: [confirmationRequestId], references: [id], onDelete: Cascade)
+  @@index([confirmationRequestId])
+  @@index([waMessageId])
+}
+
+model MessageTemplate {
+  id              String   @id @default(uuid())
+  orgId           String
+  wabaId          String?
+  name            String
+  language        String   @default("en_US")
+  category        String   @default("UTILITY") // UTILITY, MARKETING, AUTHENTICATION
+  status          String   @default("PENDING") // PENDING, APPROVED, REJECTED
+  components      Json?
+  metaTemplateId  String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  org             Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  @@unique([orgId, name, language])
+  @@index([orgId])
+}
+
+model WebhookEvent {
+  id                String   @id @default(uuid())
+  orgId             String?
+  source            String   // shopify, whatsapp
+  topic             String?  // orders/create, messages, etc
+  shopifyWebhookId  String?
+  idempotencyKey    String   @unique
+  payload           Json
+  hmacValid         Boolean  @default(false)
+  processed         Boolean  @default(false)
+  error             String?
+  createdAt         DateTime @default(now())
+  org               Organization? @relation(fields: [orgId], references: [id], onDelete: SetNull)
+  @@index([source])
+  @@index([processed])
+  @@index([createdAt])
+}
+
+model AuditLog {
+  id          String   @id @default(uuid())
+  orgId       String
+  actorType   String   // user, system, webhook
+  actorId     String?
+  action      String   // e.g. PHONE_REVEAL, ORDER_CONFIRMED, STATE_TRANSITION
+  entityType  String   // order, confirmation_request, customer, etc
+  entityId    String?
+  metadata    Json?
+  createdAt   DateTime @default(now())
+  org         Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  @@index([orgId])
+  @@index([entityType, entityId])
+  @@index([createdAt])
+}
+
+model NotificationSetting {
+  id              String   @id @default(uuid())
+  orgId           String   @unique
+  enablePush      Boolean  @default(true)
+  rules           Json?    // { minCodValue, maxCodValue, ignorePrepaid, sendDelaySeconds, reminderCount, reminderIntervalMinutes, expirationMinutes, requireCancellationApproval }
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  org             Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+}
+
+model DevicePushToken {
+  id              String   @id @default(uuid())
+  userId          String
+  orgId           String
+  expoPushToken   String   @unique
+  platform        String?  // android, ios
+  lastActive      DateTime @default(now())
+  createdAt       DateTime @default(now())
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  org             Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  @@index([orgId])
+  @@index([userId])
+}
+
+model Subscription {
+  id        String   @id @default(uuid())
+  orgId     String   @unique
+  plan      String   @default("free")
+  status    String   @default("active")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model UsageRecord {
+  id        String   @id @default(uuid())
+  orgId     String
+  metric    String   // whatsapp_messages_sent, orders_confirmed, etc
+  count     Int      @default(1)
+  period    String   // e.g. 2026-09
+  createdAt DateTime @default(now())
+  @@index([orgId, period])
+}
