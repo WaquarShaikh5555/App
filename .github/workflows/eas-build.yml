@@ -295,6 +295,16 @@ jobs:
           sdkmanager --install "cmake;3.22.1" || echo "::warning::cmake not pre-installed; AGP may fetch it on demand"
           sdkmanager --list_installed | sed -n '1,25p'
 
+      # The debug keystore that signs the release build is generated on first use, and a
+      # fresh one every run means every build has a different signature: Android then
+      # refuses to install an update over the previous app ("App not installed") and the
+      # phone has to uninstall first. Caching the file keeps the signature stable.
+      - name: Keep the signing key stable across builds
+        uses: actions/cache@v6
+        with:
+          path: ~/.android/debug.keystore
+          key: android-debug-keystore-v1
+
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
 
@@ -364,6 +374,36 @@ jobs:
             echo "| size | $(du -h "$APK" | cut -f1) |"
             echo "| sha256 | \`$SHA\` |"
             echo "| built from | \`${GITHUB_SHA}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Everything needed to set up Google sign-in, printed where it can be copied.
+          PACKAGE_NAME="com.orderconfirm.merchant"
+          SIGNER_SHA1=""
+          APKSIGNER="$(ls "$ANDROID_HOME"/build-tools/*/apksigner 2>/dev/null | tail -1 || true)"
+          if [ -n "$APKSIGNER" ]; then
+            SIGNER_SHA1=$("$APKSIGNER" verify --print-certs "$APK" 2>/dev/null \
+              | grep -i "SHA-1 certificate digest" | head -1 | sed 's/.*: //' || true)
+          fi
+          echo "--- Google sign-in facts ---"
+          echo "package name : $PACKAGE_NAME"
+          echo "redirect URI : ${PACKAGE_NAME}:/oauthredirect"
+          echo "signer SHA-1 : ${SIGNER_SHA1:-(unavailable)}"
+          {
+            echo ""
+            echo "<details><summary>Google sign-in setup</summary>"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| package name | \`$PACKAGE_NAME\` |"
+            echo "| redirect URI | \`${PACKAGE_NAME}:/oauthredirect\` |"
+            echo "| signing SHA-1 | \`${SIGNER_SHA1:-(unavailable)}\` |"
+            echo ""
+            echo "This build is signed with an automatically generated debug keystore, so the"
+            echo "SHA-1 above is only valid for this keystore. Google sign-in stays hidden until"
+            echo "client IDs are set in \`mobile/app.json\` (expo.extra.googleAuth) and"
+            echo "\`GOOGLE_CLIENT_ID\` is set on the backend."
+            echo ""
+            echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload APK as build artifact
