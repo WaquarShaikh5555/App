@@ -381,13 +381,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           APK="${{ steps.apk.outputs.path }}"
+          # Publish under a readable name, so the download URL is predictable.
+          cp "$APK" OrderConfirm-release.apk
           gh release delete apk-latest --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
           NOTES="Installable Android build (JavaScript bundled in, no dev server needed)."$'\n\n'
           NOTES+="- built from commit ${GITHUB_SHA}"$'\n'
           NOTES+="- sha256 ${{ steps.apk.outputs.sha }}"$'\n'
           NOTES+="- size ${{ steps.apk.outputs.size }}"$'\n\n'
           NOTES+="Download the .apk and open it on the phone; allow installing from unknown sources."
-          gh release create apk-latest "$APK#OrderConfirm-release.apk" \
+          gh release create apk-latest OrderConfirm-release.apk \
             --repo "$GITHUB_REPOSITORY" \
             --title "OrderConfirm APK (latest build)" \
             --notes "$NOTES" \
