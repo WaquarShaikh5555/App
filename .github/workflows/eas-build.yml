@@ -5,18 +5,30 @@ on:
     branches: [main]
     paths:
       - 'mobile/**'
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: 20 }
-      - uses: expo/expo-github-action@v8
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
         with:
-          eas-version: latest
-          token: ${{ secrets.EXPO_TOKEN }}
-      - working-directory: mobile
+          node-version: 20
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+
+      - name: Install EAS CLI
+        run: npm install -g eas-cli
+
+      - name: Install mobile deps
+        working-directory: mobile
         run: npm install
-      - working-directory: mobile
+
+      - name: Build APK on Expo cloud
+        working-directory: mobile
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
         run: eas build -p android --profile preview --non-interactive --no-wait
