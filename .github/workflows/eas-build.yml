@@ -34,6 +34,12 @@ name: Build Android APK
 
 on:
   workflow_dispatch:
+    inputs:
+      api_url:
+        description: 'Backend URL the app should talk to (optional; defaults to the value in app.json)'
+        required: false
+        default: ''
+        type: string
   push:
     branches:
       - main
@@ -46,7 +52,7 @@ on:
       - '.github/scripts/**'
 
 permissions:
-  contents: read
+  contents: write   # needed to publish the APK as a release asset
 
 concurrency:
   group: apk-${{ github.ref }}
@@ -59,7 +65,7 @@ env:
 
 jobs:
   build:
-    name: Build debug APK
+    name: Build installable APK
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -292,25 +298,43 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
 
-      - name: Build debug APK
+      # assembleRelease, not assembleDebug: a debug APK contains no JavaScript and can
+      # only run against a Metro dev server. The release build runs `expo export:embed`
+      # through Gradle and packs the Hermes bytecode plus assets into the APK, so the
+      # result installs and opens on its own. The Expo template signs release builds
+      # with the debug keystore, so it installs without any signing setup.
+      - name: Build installable APK
         working-directory: mobile/android
+        env:
+          # Baked into the JS bundle at build time (see app.config.js).
+          EXPO_PUBLIC_API_URL: ${{ inputs.api_url }}
         run: |
           chmod +x gradlew
           set -o pipefail
           # tee so the Diagnostics step can extract compiler errors from the log
           # (Kotlin reports diagnostics on their own "e:" lines).
-          ./gradlew assembleDebug --no-daemon --stacktrace --console=plain 2>&1 \
+          ./gradlew assembleRelease --no-daemon --stacktrace --console=plain 2>&1 \
             | tee "${RUNNER_TEMP:-/tmp}/gradle-build.log"
 
       # --- 6. verify + publish -------------------------------------------
       - name: Verify the APK
         id: apk
         run: |
-          APK="mobile/android/app/build/outputs/apk/debug/app-debug.apk"
+          APK="mobile/android/app/build/outputs/apk/release/app-release.apk"
           test -f "$APK" || { echo "::error::$APK was not produced"; exit 1; }
 
           unzip -l "$APK" | grep -q "AndroidManifest.xml" || { echo "::error::manifest missing from APK"; exit 1; }
           unzip -l "$APK" | grep -q "classes.dex" || { echo "::error::classes.dex missing from APK"; exit 1; }
+
+          # The point of a release build: the JavaScript is inside the APK, so the app
+          # launches without a dev server. Without this the APK is uninstallable-in-practice.
+          if ! unzip -l "$APK" | grep -qE "assets/(index\.android\.bundle|.*\.hbc)"; then
+            echo "::error::no JavaScript bundle inside the APK - it would require the Metro dev server"
+            unzip -l "$APK" | grep -i "assets/" | head -20 || true
+            exit 1
+          fi
+          echo "bundled JS inside APK:"
+          unzip -l "$APK" | grep -E "assets/(index\.android\.bundle|.*\.hbc)" | head -5
 
           SIZE_BYTES=$(stat -c %s "$APK")
           if [ "$SIZE_BYTES" -lt 1000000 ]; then
@@ -322,27 +346,57 @@ jobs:
           echo "path=$APK" >> "$GITHUB_OUTPUT"
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "size=$(du -h "$APK" | cut -f1)" >> "$GITHUB_OUTPUT"
+          echo "url=https://github.com/${GITHUB_REPOSITORY}/releases/download/apk-latest/OrderConfirm-release.apk" >> "$GITHUB_OUTPUT"
 
-          echo "--- APK contents (first 25 entries) ---"
-          unzip -l "$APK" | sed -n '1,25p'
+          echo "--- APK contents (first 20 entries) ---"
+          unzip -l "$APK" | sed -n '1,20p'
           echo "--- package / launchable activity ---"
           AAPT="$(ls "$ANDROID_HOME"/build-tools/*/aapt2 2>/dev/null | tail -1 || true)"
           if [ -n "$AAPT" ]; then
             "$AAPT" dump badging "$APK" | grep -E "^package|launchable-activity" || true
           fi
-          echo "--- native libs ---"
-          unzip -l "$APK" | grep -E "lib/.*\.so" | head -10 || echo "(none)"
 
-          echo "sha256: $SHA" >> "$GITHUB_STEP_SUMMARY"
-          echo "size: $(du -h "$APK" | cut -f1)" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Installable APK built"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| size | $(du -h "$APK" | cut -f1) |"
+            echo "| sha256 | \`$SHA\` |"
+            echo "| built from | \`${GITHUB_SHA}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload APK
+      - name: Upload APK as build artifact
         uses: actions/upload-artifact@v7
         with:
           name: OrderConfirm-APK
-          path: mobile/android/app/build/outputs/apk/debug/app-debug.apk
+          path: mobile/android/app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
           retention-days: 14
+
+      # A permanent download link, so the APK does not have to be hunted for in the
+      # Actions UI and survives the artifact expiry window.
+      - name: Publish APK as a release download
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          APK="${{ steps.apk.outputs.path }}"
+          gh release delete apk-latest --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+          NOTES="Installable Android build (JavaScript bundled in, no dev server needed)."$'\n\n'
+          NOTES+="- built from commit ${GITHUB_SHA}"$'\n'
+          NOTES+="- sha256 ${{ steps.apk.outputs.sha }}"$'\n'
+          NOTES+="- size ${{ steps.apk.outputs.size }}"$'\n\n'
+          NOTES+="Download the .apk and open it on the phone; allow installing from unknown sources."
+          gh release create apk-latest "$APK#OrderConfirm-release.apk" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "OrderConfirm APK (latest build)" \
+            --notes "$NOTES" \
+            --latest || echo "::warning::could not publish the release asset; use the OrderConfirm-APK artifact from this run instead"
+
+          {
+            echo ""
+            echo "**Download:** ${{ steps.apk.outputs.url }}"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Diagnostics
         if: failure()
