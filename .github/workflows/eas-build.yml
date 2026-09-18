@@ -186,6 +186,23 @@ jobs:
         working-directory: mobile
         run: npm install --no-audit --no-fund
 
+      # Expo SDK 52 supports specific versions of the packages it manages, and the
+      # react-native version matters for more than the JS runtime: React Native's Gradle
+      # version catalog pins the Kotlin compiler, and expo-modules-core derives its Compose
+      # Compiler version from that Kotlin version. A react-native that is off the SDK's
+      # supported version therefore fails the Kotlin compile with
+      # "This version (1.5.15) of the Compose Compiler requires Kotlin version 1.9.25
+      #  but you appear to be using Kotlin version 1.9.24".
+      # bundledNativeModules.json ships inside the expo package, so this needs no Expo API
+      # call (same semantics as `npx expo install --fix`).
+      - name: Align dependency versions with the Expo SDK
+        run: |
+          python .github/scripts/align-expo-versions.py --project-root mobile | tee "${RUNNER_TEMP:-/tmp}/align.log"
+          if grep -q "are off the Expo SDK" "${RUNNER_TEMP:-/tmp}/align.log"; then
+            echo "Reinstalling so the aligned versions take effect"
+            (cd mobile && npm install --no-audit --no-fund)
+          fi
+
       # expo depends on expo-asset, but with no lockfile npm can install it nested at
       # node_modules/expo/node_modules/expo-asset rather than hoisting it. @expo/metro-config
       # resolves 'expo-asset/tools/hashAssetFiles' *from the project root*
@@ -232,6 +249,15 @@ jobs:
 
       - name: Patch react block to static paths
         run: python .github/scripts/patch-react-gradle.py --project-root mobile
+
+      # Three files from three packages decide which Kotlin and Compose Compiler this
+      # build uses: React Native's version catalog (the Kotlin plugin), the kotlinVersion
+      # that prebuild wrote into android/build.gradle (which Expo modules read), and
+      # expo-modules-core's Kotlin -> Compose Compiler map. If they disagree, Gradle fails
+      # several minutes in with "Compose Compiler requires Kotlin version X". This check is
+      # offline and instant, so it catches that before the build starts.
+      - name: Verify the Kotlin toolchain agrees
+        run: python .github/scripts/verify-kotlin-toolchain.py --project-root mobile
 
       # --- 5. build -------------------------------------------------------
       - name: Set up Android SDK
