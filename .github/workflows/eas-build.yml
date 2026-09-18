@@ -21,11 +21,28 @@ jobs:
         working-directory: mobile
         run: npm install
 
+      - name: Generate valid icons (fix 68-byte placeholder)
+        working-directory: mobile
+        run: |
+          pip install Pillow
+          python3 -c "
+          from PIL import Image
+          img=Image.new('RGB',(1024,1024),color=(37,211,102))
+          img.save('assets/icon.png')
+          img.save('assets/adaptive-icon.png')
+          img2=Image.new('RGB',(1284,2778),color=(255,255,255))
+          img2.save('assets/splash.png')
+          img3=Image.new('RGB',(96,96),color=(37,211,102))
+          img3.save('assets/notification-icon.png')
+          img3.save('assets/favicon.png')
+          print('Icons generated')
+          "
+
       - name: Prebuild Android
         working-directory: mobile
-        run: npx expo prebuild --platform android --non-interactive --no-install
+        run: npx expo prebuild --platform android --non-interactive --no-install --clean
 
-      - name: Accept Android licenses
+      - name: Accept licenses
         run: yes | sdkmanager --licenses || true
 
       - name: Build APK
