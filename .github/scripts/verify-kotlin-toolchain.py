@@ -51,6 +51,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--project-root", default=".", help="Expo project root")
     parser.add_argument("--android-dir", default=None, help="defaults to <project-root>/android")
+    parser.add_argument(
+        "--fix",
+        action="store_true",
+        help="when the pairing disagrees, pin android.kotlinVersion in gradle.properties to the "
+        "Kotlin version that actually compiles the project, so Expo's Compose map matches it",
+    )
     args = parser.parse_args()
 
     root = os.path.abspath(args.project_root)
@@ -135,6 +141,26 @@ def main():
         )
 
     if problems:
+        if args.fix and compiler and compose_for.get(compiler) and os.path.isfile(gradle_properties):
+            # The Compose Compiler must match the Kotlin compiler exactly, and the
+            # compiler is decided by React Native's version catalog, not by anything
+            # prebuild writes. So make Expo read the compiler's own version: then
+            # expo-modules-core's map selects the Compose Compiler built for it.
+            text = read(gradle_properties)
+            line = f"android.kotlinVersion={compiler}"
+            if GRADLE_PROPERTY.search(text):
+                updated = GRADLE_PROPERTY.sub(line, text)
+            else:
+                updated = text.rstrip("\n") + f"\n\n# Keep the Compose Compiler (selected by expo-modules-core from this\n# value) in step with the Kotlin plugin React Native applies.\n{line}\n"
+            with open(gradle_properties, "w", encoding="utf-8") as fh:
+                fh.write(updated)
+            print(f"::notice::pinned android.kotlinVersion={compiler} in android/gradle.properties so "
+                  f"expo-modules-core selects Compose Compiler {compose_for[compiler]}, matching the Kotlin "
+                  f"plugin that compiles this project")
+            print(f"repaired: android.kotlinVersion={compiler} "
+                  f"(Compose Compiler {compose_for[compiler]} pairs with Kotlin {compiler})")
+            return 0
+
         print("::error::Kotlin toolchain mismatch detected before running Gradle:")
         for problem in problems:
             print(f"  - {problem}")

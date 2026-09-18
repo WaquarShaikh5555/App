@@ -35,7 +35,11 @@ name: Build Android APK
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches:
+      - main
+      # While this change is under review, let the branch build itself on every push so
+      # results are verifiable without dispatching manually. Drop this line after merge.
+      - arena/01a0b30b-app
     paths:
       - 'mobile/**'
       - '.github/workflows/eas-build.yml'
@@ -62,6 +66,16 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      # Print exactly what is being built, so any log can be attributed to a revision.
+      - name: Job context
+        run: |
+          echo "ref        : ${GITHUB_REF} (${GITHUB_REF_NAME})"
+          echo "commit     : ${GITHUB_SHA}"
+          git log -1 --pretty='subject    : %s' || true
+          echo "workflow   : $(sha256sum .github/workflows/eas-build.yml | cut -c1-16) (sha256, first 16)"
+          node -p "const p=require('./mobile/package.json'); JSON.stringify({main:p.main, expo:p.dependencies.expo, 'react-native':p.dependencies['react-native'], 'react-native-screens':p.dependencies['react-native-screens']}, null, 1)" || true
+          echo "assets     :"; ls -l mobile/assets || true
 
       - name: Set up Node 22
         uses: actions/setup-node@v7
@@ -254,10 +268,14 @@ jobs:
       # build uses: React Native's version catalog (the Kotlin plugin), the kotlinVersion
       # that prebuild wrote into android/build.gradle (which Expo modules read), and
       # expo-modules-core's Kotlin -> Compose Compiler map. If they disagree, Gradle fails
-      # several minutes in with "Compose Compiler requires Kotlin version X". This check is
-      # offline and instant, so it catches that before the build starts.
+      # several minutes in with "Compose Compiler requires Kotlin version X". --fix makes
+      # the two numbers agree (pinning android.kotlinVersion to the version the Kotlin
+      # plugin actually applies), then the check re-runs to prove the pairing is safe -
+      # all offline, in milliseconds, before any Gradle task starts.
       - name: Verify the Kotlin toolchain agrees
-        run: python .github/scripts/verify-kotlin-toolchain.py --project-root mobile
+        run: |
+          python .github/scripts/verify-kotlin-toolchain.py --project-root mobile --fix
+          python .github/scripts/verify-kotlin-toolchain.py --project-root mobile
 
       # --- 5. build -------------------------------------------------------
       - name: Set up Android SDK
