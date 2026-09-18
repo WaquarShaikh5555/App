@@ -295,16 +295,6 @@ jobs:
           sdkmanager --install "cmake;3.22.1" || echo "::warning::cmake not pre-installed; AGP may fetch it on demand"
           sdkmanager --list_installed | sed -n '1,25p'
 
-      # The debug keystore that signs the release build is generated on first use, and a
-      # fresh one every run means every build has a different signature: Android then
-      # refuses to install an update over the previous app ("App not installed") and the
-      # phone has to uninstall first. Caching the file keeps the signature stable.
-      - name: Keep the signing key stable across builds
-        uses: actions/cache@v6
-        with:
-          path: ~/.android/debug.keystore
-          key: android-debug-keystore-v1
-
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
 
@@ -312,7 +302,11 @@ jobs:
       # only run against a Metro dev server. The release build runs `expo export:embed`
       # through Gradle and packs the Hermes bytecode plus assets into the APK, so the
       # result installs and opens on its own. The Expo template signs release builds
-      # with the debug keystore, so it installs without any signing setup.
+      # with the debug keystore, so it installs without any signing setup. The
+      # keystore is the one checked into expo-template-bare-minimum (android/app/debug.keystore),
+      # so the signature is identical on every run and a new APK installs straight over the
+      # previous one. Its certificate SHA-1 is printed in the step summary, and is the value
+      # to register if Google sign-in is set up.
       - name: Build installable APK
         working-directory: mobile/android
         env:

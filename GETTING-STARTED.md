@@ -20,10 +20,9 @@ Download and open this on the phone:
 
 Android will warn that the file is from an unknown source — allow it for this install.
 
-> **Install over an old copy?** Uninstall the previous OrderConfirm first. Earlier builds
-> were each signed with a different key, so Android refuses to update one over another and
-> only says "App not installed". (Builds from this point on keep the same key, so this is
-> a one-time thing.)
+> This installs straight over an older OrderConfirm: every build is signed with the same
+> key. If Android does say **"App not installed"**, uninstall the old copy first and try
+> again.
 
 ## 2. Start the backend
 
@@ -105,8 +104,16 @@ I will wire it into the app and the backend and build a new APK. On the backend 
 becomes `GOOGLE_CLIENT_ID`; the server checks that every Google token was issued for your
 app before accepting it.
 
-Each release page shows the package name, redirect URI and signing SHA-1 under
-"Google sign-in setup", so you have them when the console asks.
+The values the console asks for:
+
+| Field | Value |
+|---|---|
+| Package name | `com.orderconfirm.merchant` |
+| Redirect URI | `com.orderconfirm.merchant:/oauthredirect` |
+| Signing certificate SHA-1 | `EF:AA:2A:79:B8:4B:AB:D4:F7:85:28:E0:1D:E3:42:14:8D:03:F8:BB` |
+
+Every build also prints these under "Google sign-in setup" in its run summary, so if the
+SHA-1 ever changes, that page is the current value.
 
 ---
 
