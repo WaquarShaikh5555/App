@@ -176,8 +176,24 @@ def first_existing(paths, fallback):
 
 
 def gradle_path(app_dir, target_abs):
-    rel = os.path.relpath(target_abs, app_dir)
-    return "./" + rel.replace(os.sep, "/") if not rel.startswith(".") else rel.replace(os.sep, "/")
+    """Absolute, forward-slashed path.
+
+    Deliberately absolute: these values are consumed in two different ways, with two
+    different working directories.
+
+      * `file(...)` / DirectoryProperty values are resolved against the Gradle project
+        directory (android/app), and forwarding them through File.cliPath() makes them
+        absolute anyway;
+      * `hermesCommand` is a plain String that becomes part of an executed command
+        line, run with the React Native root (the folder holding package.json) as its
+        working directory, and it is never normalised - so a relative path there points
+        somewhere else entirely and the build dies with
+        "Cannot run program \"../../node_modules/react-native/sdks/hermesc/...\"".
+
+    This mirrors what the dynamic expressions we replace produced: they all ended in
+    getAbsolutePath()/getAbsoluteFile().
+    """
+    return os.path.abspath(target_abs).replace(os.sep, "/")
 
 
 def build_static_values(project_root, app_dir):
@@ -218,24 +234,26 @@ def build_static_values(project_root, app_dir):
         os.path.join(root_abs, "node_modules", "@expo", "cli", "build", "bin", "cli"),
     )
 
-    rn_rel = gradle_path(app_abs, rn_abs)
+    rn_path = gradle_path(app_abs, rn_abs)
     values = {
         "entryFile": gradle_path(app_abs, entry_abs),
-        "reactNativeDir": rn_rel,
+        "reactNativeDir": rn_path,
         # Property<String>: a plain string, so %OS-BIN% stays a literal for the
         # React Native Gradle plugin to substitute (linux64-bin on CI).
-        "hermesCommand": f"{rn_rel}/sdks/hermesc/%OS-BIN%/hermesc",
+        "hermesCommand": f"{rn_path}/sdks/hermesc/%OS-BIN%/hermesc",
         "codegenDir": gradle_path(app_abs, codegen_abs),
         "cliFile": gradle_path(app_abs, cli_abs),
     }
 
     # Filesystem facts used for validation/warnings, keyed by property name.
+    # hermesCommand is executed, so resolve %OS-BIN% for this platform.
+    os_bin = {"win32": "win64-bin", "darwin": "osx-bin"}.get(sys.platform, "linux64-bin")
     checks = {
         "entryFile": entry_abs,
         "reactNativeDir": rn_abs,
         "codegenDir": codegen_abs,
         "cliFile": cli_abs,
-        "hermesCommand": os.path.join(rn_abs, "sdks", "hermesc", "linux64-bin", "hermesc"),
+        "hermesCommand": os.path.join(rn_abs, "sdks", "hermesc", os_bin, "hermesc"),
     }
     return values, checks, main
 
@@ -329,25 +347,41 @@ def main():
             written[match.group(1)] = strip_quotes(match.group(2))
 
     problems = []
+    warnings = []
     log("")
-    log(f"{'property':<16} {'path written to build.gradle':<44} status")
-    log("-" * 78)
+    log(f"{'property':<16} {'path written to build.gradle':<52} status")
+    log("-" * 88)
     for name in ALL_PROPERTIES:
         value = written.get(name, values[name])
         declared = value
         if declared.startswith("file("):
             declared = strip_quotes(declared[5:-1])
-        absolute = checks[name] if name != "hermesCommand" else checks[name].replace("%OS-BIN%", "linux64-bin")
+        absolute = checks[name]
+        if name == "hermesCommand":
+            absolute = absolute.replace("%OS-BIN%", {"win32": "win64-bin", "darwin": "osx-bin"}.get(sys.platform, "linux64-bin"))
         exists = os.path.exists(absolute)
-        status = "ok" if exists else "MISSING"
-        if name == "hermesCommand" and not exists:
-            # Only consulted when hermesEnabled=true; warn instead of failing so a
-            # JSC-only project can still build.
-            status = "warn (hermesc not found)"
-        elif not exists:
+        if not os.path.isabs(declared):
+            problems.append(
+                f"{name} -> {declared} is not an absolute path; Gradle and the React Native plugin "
+                "resolve these against different working directories, so relative paths break the "
+                "release build (hermesc is executed from the project root)."
+            )
+            status = "RELATIVE"
+        elif exists and name == "hermesCommand" and not os.access(absolute, os.X_OK):
+            # hermesc is executed, so the exec bit matters on Linux/macOS.
+            warnings.append(f"{name} -> {absolute} is not executable (chmod +x)")
+            status = "warn (not executable)"
+        elif exists:
+            status = "ok"
+        else:
+            # Only consulted when hermesEnabled=true, but a missing hermesc does fail
+            # the release bundle step, so this is fatal too.
             problems.append(f"{name} -> {declared} does not exist (checked {absolute})")
-        log(f"{name:<16} {declared:<44} {status}")
+            status = "MISSING"
+        log(f"{name:<16} {declared:<52} {status}")
     log("")
+    for warning in warnings:
+        log(f"warning: {warning}")
 
     if problems:
         raise SystemExit("static path validation failed:\n  - " + "\n  - ".join(problems))
