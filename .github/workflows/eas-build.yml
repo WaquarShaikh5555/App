@@ -1,11 +1,10 @@
 name: Build APK (Preview)
-
 on:
   workflow_dispatch:
   push:
     branches: [main]
-    paths: ['mobile/**']
-
+    paths:
+      - 'mobile/**'
 jobs:
   build:
     runs-on: ubuntu-latest
