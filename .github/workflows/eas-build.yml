@@ -1,52 +1,320 @@
-name: Build APK Local
+name: Build Android APK
+
+# Builds a debug APK with the local Android toolchain (no EAS cloud service).
+#
+# The committed state cannot build as-is, so this workflow repairs it first:
+#
+#  1. mobile/package.json sets "main": "expo-router/entry", but expo-router is not
+#     installed and there is no app/ directory. Expo's Android template resolves the
+#     entry point by shelling out to Node *while Gradle configures* the project:
+#
+#         entryFile = file(["node", "-e", "require('expo/scripts/resolveAppEntry')",
+#                           projectRoot, "android", "absolute"].execute(null, rootDir).text.trim())
+#
+#     List.execute() captures stdout only, so when the Node helper exits 1 with a
+#     ConfigError (ENTRY_NOT_FOUND) the expression becomes file('') and Gradle dies
+#     at android/app/build.gradle line 12 with `path=''`. Fixing `main` is not enough
+#     on its own: pointing it straight at App.tsx bundles fine but never calls
+#     registerRootComponent(), so the APK crashes with "main has not been registered".
+#     This workflow therefore writes a one-line index.js shim and points `main` at it.
+#
+#  2. All five PNGs in mobile/assets/ are 68-byte 1x1 stubs. Real 1024px (etc.)
+#     artwork is generated with Pillow and verified before prebuild turns it into
+#     launcher/splash/notification resources.
+#
+#  3. Prebuild's generated `react { }` block resolves reactNativeDir, hermesCommand,
+#     codegenDir and cliFile by executing Node during Gradle *configuration* too - four
+#     more subprocess calls whose stdout must resolve. .github/scripts/patch-react-gradle.py
+#     rewrites all five properties to static paths, checks every path on disk, and fails
+#     fast if it cannot (before Gradle runs). The remaining `require.resolve(...)` calls in
+#     android/settings.gradle and android/build.gradle are left alone on purpose: they
+#     resolve *installed* packages rather than the app entry, so they succeed once
+#     node_modules exists - which is why the original failure surfaced at app/build.gradle
+#     line 12 and not earlier.
+
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'mobile/**'
+      - '.github/workflows/eas-build.yml'
+      - '.github/scripts/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # expo prebuild --non-interactive is deprecated; CI=1 is the supported switch.
+  CI: '1'
+  EXPO_NO_TELEMETRY: '1'
 
 jobs:
   build:
+    name: Build debug APK
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: 22 }
-      - uses: actions/setup-java@v4
-        with: { distribution: temurin, java-version: 17 }
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Install deps
-        working-directory: mobile
-        run: npm install
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
 
-      - name: Fix icons
+      # mobile/ has no lockfile, so caching is keyed on package.json.
+      - name: Cache npm downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ hashFiles('mobile/package.json') }}
+          restore-keys: npm-${{ runner.os }}-
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # --- 1. entry point -------------------------------------------------
+      - name: Fix the JavaScript entry point
         working-directory: mobile
         run: |
-          pip install Pillow
-          python3 -c "from PIL import Image; i=Image.new('RGB',(1024,1024),color=(37,211,102)); i.save('assets/icon.png'); i.save('assets/adaptive-icon.png'); j=Image.new('RGB',(1284,2778),color=(255,255,255)); j.save('assets/splash.png'); k=Image.new('RGB',(96,96),color=(37,211,102)); k.save('assets/notification-icon.png'); k.save('assets/favicon.png')"
+          node <<'NODE'
+          const fs = require('fs');
 
-      - name: Prebuild
+          const EXTENSIONS = ['', '.tsx', '.ts', '.jsx', '.js'];
+          const COMPONENTS = ['App.tsx', 'App.ts', 'App.jsx', 'App.js', 'src/App.tsx', 'src/App.jsx'];
+          const REGISTERS_ROOT = /registerRootComponent|registerComponent\s*\(/;
+
+          const resolveMain = (main) => {
+            if (!main) return null;
+            for (const base of [main, `node_modules/${main}`]) {
+              for (const ext of EXTENSIONS) {
+                const candidate = base + ext;
+                if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
+              }
+            }
+            return null;
+          };
+
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          const current = resolveMain(pkg.main);
+
+          if (current && REGISTERS_ROOT.test(fs.readFileSync(current, 'utf8'))) {
+            console.log(`Entry point already correct: main=${JSON.stringify(pkg.main)} -> ${current}`);
+            process.exit(0);
+          }
+
+          console.log(`package.json main = ${JSON.stringify(pkg.main)}`);
+          console.log(current
+            ? `  ...resolves to ${current}, which never calls registerRootComponent()`
+            : '  ...does not resolve to any file');
+
+          const component = COMPONENTS.find((file) => fs.existsSync(file));
+          if (!component) {
+            console.error(`::error::none of ${COMPONENTS.join(', ')} exists - cannot create an entry point`);
+            process.exit(1);
+          }
+
+          const specifier = './' + component.replace(/\.(tsx|ts|jsx|js)$/, '');
+          fs.writeFileSync(
+            'index.js',
+            `import { registerRootComponent } from 'expo';\n\nimport App from '${specifier}';\n\nregisterRootComponent(App);\n`,
+          );
+
+          pkg.main = 'index.js';
+          fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          console.log(`Wrote index.js (imports ${specifier}) and set main = "index.js"`);
+          NODE
+
+          echo "--- package.json ---"
+          node -p "JSON.stringify({name: require('./package.json').name, main: require('./package.json').main})"
+          if [ -f index.js ]; then
+            echo "--- index.js ---"
+            cat index.js
+          else
+            echo "--- index.js ---"
+            echo "(not needed: the existing entry point already registers the root component)"
+          fi
+
+      # --- 2. icons -------------------------------------------------------
+      - name: Install Pillow
+        run: python -m pip install --disable-pip-version-check pillow
+
+      - name: Generate real app assets
+        run: python .github/scripts/gen-icons.py mobile/assets
+
+      - name: Verify assets are not placeholders
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+
+          from PIL import Image
+
+          required = ["icon.png", "adaptive-icon.png", "splash.png", "notification-icon.png", "favicon.png"]
+          failures = []
+          for name in required:
+              path = os.path.join("mobile", "assets", name)
+              if not os.path.exists(path):
+                  failures.append(f"{name}: missing")
+                  continue
+              with Image.open(path) as img:
+                  size = os.path.getsize(path)
+                  print(f"  {name:<22} {img.size[0]}x{img.size[1]:<6} {img.mode:<5} {size:,} bytes")
+                  if min(img.size) < 48:
+                      failures.append(f"{name}: {img.size[0]}x{img.size[1]} is still a placeholder")
+          if failures:
+              print("::error::placeholder assets remain: " + "; ".join(failures))
+              sys.exit(1)
+          PY
+
+      # --- 3. dependencies ------------------------------------------------
+      - name: Install dependencies
         working-directory: mobile
-        run: npx expo prebuild --platform android --non-interactive --no-install --clean
+        run: npm install --no-audit --no-fund
 
-      - name: Patch build.gradle - fix path='' bug
+      # expo depends on expo-asset, but with no lockfile npm can install it nested at
+      # node_modules/expo/node_modules/expo-asset rather than hoisting it. @expo/metro-config
+      # resolves 'expo-asset/tools/hashAssetFiles' *from the project root*
+      # (resolveFrom.silent(projectRoot, ...)), so bundling then dies with
+      # "The required package `expo-asset` cannot be found". A direct dependency is always
+      # placed at the top level. The range is read from the installed expo package, so this
+      # needs no Expo API call and cannot drift from the SDK's expected version.
+      - name: Ensure expo-asset resolves from the project root
         working-directory: mobile
         run: |
-          echo "Before patch line 12:"
-          sed -n '1,20p' android/app/build.gradle
-          # Replace the dynamic node resolve with static path
-          sed -i "s|def reactNativeDir =.*|def reactNativeDir = new File(rootDir, \"../node_modules/react-native\").getAbsolutePath()|" android/app/build.gradle
-          echo "After patch:"
-          sed -n '1,20p' android/app/build.gradle
-          # Also ensure react-native exists
-          ls -la node_modules/react-native/package.json
+          if node -e "require.resolve('expo-asset/tools/hashAssetFiles')" 2>/dev/null; then
+            echo "expo-asset already resolves from the project root"
+          else
+            RANGE="$(node -p "require('expo/package.json').dependencies['expo-asset'] || ''")"
+            if [ -z "$RANGE" ]; then
+              echo "::error::the installed expo package does not declare expo-asset"
+              exit 1
+            fi
+            echo "expo-asset was only reachable as a nested dependency; installing expo-asset@${RANGE}"
+            npm install "expo-asset@${RANGE}" --no-audit --no-fund
+            node -e "require.resolve('expo-asset/tools/hashAssetFiles')"
+          fi
 
-      - name: Accept licenses
-        run: yes | sdkmanager --licenses || true
+      # Fail fast on entry point / module graph problems, before Gradle runs.
+      - name: Verify Expo can resolve the entry point
+        working-directory: mobile
+        run: |
+          entry="$(node -e "require('expo/scripts/resolveAppEntry')" "$PWD" android absolute)"
+          echo "resolveAppEntry -> '${entry}'"
+          if [ -z "$entry" ]; then
+            echo "::error::resolveAppEntry returned an empty path; Gradle would fail with path=''"
+            exit 1
+          fi
+          test -f "$entry" || { echo "::error::$entry does not exist"; exit 1; }
 
-      - name: Build APK
+      - name: Smoke test the JavaScript bundle
+        working-directory: mobile
+        run: npx expo export --platform android --output-dir "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/expo-export"
+
+      # --- 4. native project ---------------------------------------------
+      - name: Prebuild the Android project
+        working-directory: mobile
+        run: npx expo prebuild --platform android --clean --no-install
+
+      - name: Patch react block to static paths
+        run: python .github/scripts/patch-react-gradle.py --project-root mobile
+
+      # --- 5. build -------------------------------------------------------
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+          sdkmanager --install "ndk;26.1.10909125" || echo "::warning::NDK not pre-installed; AGP may fetch it on demand"
+          sdkmanager --install "cmake;3.22.1" || echo "::warning::cmake not pre-installed; AGP may fetch it on demand"
+          sdkmanager --list_installed | sed -n '1,25p'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build debug APK
         working-directory: mobile/android
-        run: ./gradlew assembleDebug --no-daemon --stacktrace
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      # --- 6. verify + publish -------------------------------------------
+      - name: Verify the APK
+        id: apk
+        run: |
+          APK="mobile/android/app/build/outputs/apk/debug/app-debug.apk"
+          test -f "$APK" || { echo "::error::$APK was not produced"; exit 1; }
+
+          unzip -l "$APK" | grep -q "AndroidManifest.xml" || { echo "::error::manifest missing from APK"; exit 1; }
+          unzip -l "$APK" | grep -q "classes.dex" || { echo "::error::classes.dex missing from APK"; exit 1; }
+
+          SIZE_BYTES=$(stat -c %s "$APK")
+          if [ "$SIZE_BYTES" -lt 1000000 ]; then
+            echo "::error::APK is suspiciously small ($SIZE_BYTES bytes)"
+            exit 1
+          fi
+
+          SHA=$(sha256sum "$APK" | cut -d' ' -f1)
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "size=$(du -h "$APK" | cut -f1)" >> "$GITHUB_OUTPUT"
+
+          echo "--- APK contents (first 25 entries) ---"
+          unzip -l "$APK" | sed -n '1,25p'
+          echo "--- package / launchable activity ---"
+          AAPT="$(ls "$ANDROID_HOME"/build-tools/*/aapt2 2>/dev/null | tail -1 || true)"
+          if [ -n "$AAPT" ]; then
+            "$AAPT" dump badging "$APK" | grep -E "^package|launchable-activity" || true
+          fi
+          echo "--- native libs ---"
+          unzip -l "$APK" | grep -E "lib/.*\.so" | head -10 || echo "(none)"
+
+          echo "sha256: $SHA" >> "$GITHUB_STEP_SUMMARY"
+          echo "size: $(du -h "$APK" | cut -f1)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: OrderConfirm-APK
           path: mobile/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          echo "::group::package.json main"
+          node -p "require('./mobile/package.json').main" || true
+          echo "::endgroup::"
+
+          if [ -f mobile/index.js ]; then
+            echo "::group::mobile/index.js"
+            cat mobile/index.js
+            echo "::endgroup::"
+          fi
+
+          if [ -f mobile/android/app/build.gradle ]; then
+            echo "::group::react block in android/app/build.gradle"
+            sed -n '/^react {/,/^}/p' mobile/android/app/build.gradle
+            echo "::endgroup::"
+          fi
+
+          echo "::group::entry point resolution"
+          (cd mobile && node -e "require('expo/scripts/resolveAppEntry')" "$PWD" android absolute) || true
+          echo "::endgroup::"
