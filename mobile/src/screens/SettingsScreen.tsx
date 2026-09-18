@@ -1,7 +1,9 @@
 import React, { useEffect, useState } from 'react';
 import { View, Text, StyleSheet, ScrollView, Switch, TextInput, Button, Alert, ActivityIndicator } from 'react-native';
-import { settingsApi, shopifyApi, whatsappApi } from '../services/api';
+import { settingsApi, shopifyApi, whatsappApi, describeApiError } from '../services/api';
 import { clearTokens } from '../services/storage';
+import { notifySessionChange } from '../services/session';
+import { getApiUrl } from '../services/serverConfig';
 
 export default function SettingsScreen({ navigation }: any) {
   const [settings, setSettings] = useState<any>(null);
@@ -23,7 +25,10 @@ export default function SettingsScreen({ navigation }: any) {
         setWaStatus(waRes.data);
       } catch {}
     } catch (e: any) {
-      Alert.alert('Error', e.message);
+      Alert.alert('Could not load settings', describeApiError(e), [
+        { text: 'Server settings', onPress: () => navigation.navigate('ServerSettings') },
+        { text: 'OK', style: 'cancel' },
+      ]);
     }
     setLoading(false);
   };
@@ -43,8 +48,8 @@ export default function SettingsScreen({ navigation }: any) {
 
   const handleLogout = async () => {
     await clearTokens();
-    Alert.alert('Logged out', 'Please restart app');
-    navigation.replace('Login');
+    // The navigator listens for this and swaps back to the login screen by itself.
+    notifySessionChange();
   };
 
   if (loading) return <View style={styles.center}><ActivityIndicator /><Text>Loading settings...</Text></View>;
@@ -100,6 +105,12 @@ export default function SettingsScreen({ navigation }: any) {
 
         <Text style={styles.label}>Expiration (minutes)</Text>
         <TextInput style={styles.input} keyboardType="numeric" value={String(rules.expirationMinutes ?? 1440)} onChangeText={v => updateRules({ expirationMinutes: parseInt(v) || 1440 })} />
+      </View>
+
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>Server</Text>
+        <Text style={{ color: '#666', marginBottom: 8 }}>{getApiUrl()}</Text>
+        <Button title="Change backend address" onPress={() => navigation.navigate('ServerSettings')} />
       </View>
 
       <View style={styles.card}>

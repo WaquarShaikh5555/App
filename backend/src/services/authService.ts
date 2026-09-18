@@ -99,3 +99,60 @@ export async function refreshTokens(refreshToken: string) {
     throw new Error('Invalid refresh token');
   }
 }
+
+/**
+ * Sign in with Google.
+ *
+ * The app sends the ID token that Google issued; the token is verified with Google before any
+ * account is touched. A user is created on first sign-in (with no usable password), together
+ * with an organization, membership and notification defaults, mirroring registerUser.
+ */
+export async function loginOrRegisterWithGoogle(email: string, name?: string) {
+  const normalisedEmail = email.trim().toLowerCase();
+  let user: any;
+
+  if (isMockMode()) {
+    user = mockStore.users.find((u) => u.email === normalisedEmail);
+  } else {
+    user = await prisma.user.findUnique({ where: { email: normalisedEmail } });
+  }
+
+  if (!user) {
+    // Random password: the account exists for OAuth only, and the hash is never matched
+    // because password login for it would need the original random value.
+    const randomPassword = uuidv4() + uuidv4();
+    // registerUser creates the org, membership, shop and notification settings for us.
+    await registerUser(normalisedEmail, randomPassword, name, undefined);
+  }
+
+  // Hand over to the normal login path so tokens and the response shape stay identical.
+  return issueSessionForEmail(normalisedEmail);
+}
+
+/** Issue tokens for an existing account, without a password check. */
+async function issueSessionForEmail(email: string) {
+  let user: any;
+  let membership: any;
+  let org: any;
+
+  if (isMockMode()) {
+    user = mockStore.users.find((u) => u.email === email);
+    if (!user) throw new Error('Invalid credentials');
+    membership = mockStore.memberships.find((m) => m.userId === user.id);
+    org = mockStore.orgs.find((o) => o.id === membership?.orgId);
+  } else {
+    user = await prisma.user.findUnique({ where: { email } });
+    if (!user) throw new Error('Invalid credentials');
+    membership = await prisma.membership.findFirst({ where: { userId: user.id } });
+    if (!membership) throw new Error('No organization');
+    org = await prisma.organization.findUnique({ where: { id: membership.orgId } });
+  }
+
+  if (!membership || !org) throw new Error('No org membership');
+
+  const payload = { userId: user.id, orgId: org.id, email: user.email, role: membership.role };
+  const accessToken = jwt.sign(payload, config.jwtSecret, { expiresIn: '15m' });
+  const refreshToken = jwt.sign(payload, config.jwtRefreshSecret, { expiresIn: '30d' });
+
+  return { user, org, membership, accessToken, refreshToken };
+}
