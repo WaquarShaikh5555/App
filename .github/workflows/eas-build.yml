@@ -17,9 +17,6 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Install deps
         working-directory: mobile
         run: npm install
@@ -28,9 +25,12 @@ jobs:
         working-directory: mobile
         run: npx expo prebuild --platform android --non-interactive --no-install
 
+      - name: Accept Android licenses
+        run: yes | sdkmanager --licenses || true
+
       - name: Build APK
         working-directory: mobile/android
-        run: ./gradlew assembleDebug
+        run: ./gradlew assembleDebug --no-daemon
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
