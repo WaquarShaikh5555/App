@@ -430,6 +430,36 @@ jobs:
           echo "::group::failing tasks"
           grep -aE "^> Task .*FAILED|^FAILURE:|^BUILD FAILED" "$LOG" | head -10 || true
           echo "::endgroup::"
+          while IFS= read -r line; do
+            echo "::error::$(printf '%s' "$line" | cut -c1-900)"
+          done < <(grep -aE "^> Task .*FAILED|^BUILD FAILED" "$LOG" | head -4 || true)
+
+          # "What went wrong" is the most informative part of any Gradle failure, so
+          # surface it as annotations even when there is no Kotlin diagnostic.
+          WHAT="$(awk '/^\* What went wrong:/{f=1;next} /^\* Try:/{f=0} f' "$LOG" | sed '/^[[:space:]]*$/d' | head -12 || true)"
+          if [ -n "$WHAT" ]; then
+            echo "::group::what went wrong"
+            printf '%s\n' "$WHAT"
+            echo "::endgroup::"
+            while IFS= read -r line; do
+              echo "::error::$(printf '%s' "$line" | cut -c1-900)"
+            done < <(printf '%s\n' "$WHAT" | head -5)
+          fi
+
+          # Non-Gradle errors (the Expo CLI / Node faulter the bundle step, for example).
+          NODEERR="$(grep -aE "^(Error|error): |Command failed: |No such file or directory|EACCES|ENOSPC|OutOfMemoryError|Lint found" "$LOG" | sort -u | head -8 || true)"
+          if [ -n "$NODEERR" ]; then
+            echo "::group::other errors"
+            printf '%s\n' "$NODEERR"
+            echo "::endgroup::"
+            while IFS= read -r line; do
+              echo "::error::$(printf '%s' "$line" | cut -c1-900)"
+            done < <(printf '%s\n' "$NODEERR" | head -4)
+          fi
+
+          # Last resort: the tail of the log, so a novel failure still reports something.
+          TAIL="$(grep -avE "^\s*$" "$LOG" | tail -8 | tr '\n' '~' | cut -c1-900 || true)"
+          if [ -n "$TAIL" ]; then echo "::notice::log tail: $TAIL"; fi
 
           # Kotlin diagnostics. These are emitted as annotations so they are readable
           # from the Actions UI (and from the API) without downloading the log.
@@ -459,8 +489,11 @@ jobs:
             echo "::endgroup::"
             # Guarantee a trailing newline: tr eats it, and `read` discards a final
             # line that is not newline-terminated.
-            CHUNKS="$( { tr '\n' '|' < "$DEPS"; echo; } | fold -w 800 | head -3 )" || true
-            printf '%s\n' "$CHUNKS" | while IFS= read -r chunk; do
-              [ -n "$chunk" ] && echo "::notice::resolved deps: $chunk"
-            done
+            CHUNKS="$( { tr '\n' '|' < "$DEPS"; echo; } | fold -w 800 | head -3 || true)"
+            while IFS= read -r chunk; do
+              if [ -n "$chunk" ]; then echo "::notice::resolved deps: $chunk"; fi
+            done < <(printf '%s\n' "$CHUNKS")
           fi
+
+          # Diagnostics must never fail the job on its own.
+          true
