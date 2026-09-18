@@ -252,7 +252,11 @@ jobs:
         working-directory: mobile/android
         run: |
           chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon --stacktrace
+          set -o pipefail
+          # tee so the Diagnostics step can extract compiler errors from the log
+          # (Kotlin reports diagnostics on their own "e:" lines).
+          ./gradlew assembleDebug --no-daemon --stacktrace --console=plain 2>&1 \
+            | tee "${RUNNER_TEMP:-/tmp}/gradle-build.log"
 
       # --- 6. verify + publish -------------------------------------------
       - name: Verify the APK
@@ -318,3 +322,47 @@ jobs:
           echo "::group::entry point resolution"
           (cd mobile && node -e "require('expo/scripts/resolveAppEntry')" "$PWD" android absolute) || true
           echo "::endgroup::"
+
+          LOG="${RUNNER_TEMP:-/tmp}/gradle-build.log"
+          if [ ! -f "$LOG" ]; then
+            echo "no Gradle log at $LOG"
+            exit 0
+          fi
+
+          echo "::group::failing tasks"
+          grep -aE "^> Task .*FAILED|^FAILURE:|^BUILD FAILED" "$LOG" | head -10 || true
+          echo "::endgroup::"
+
+          # Kotlin diagnostics. These are emitted as annotations so they are readable
+          # from the Actions UI (and from the API) without downloading the log.
+          echo "::group::Kotlin diagnostics"
+          grep -aE "^(e|w): " "$LOG" | head -12 || true
+          echo "::endgroup::"
+          while IFS= read -r line; do
+            echo "::error::$(printf '%s' "$line" | cut -c1-900)"
+          done < <(grep -aE "^e: " "$LOG" | head -5 || true)
+
+          # Version-skew fingerprints worth seeing even when the e: lines are terse.
+          echo "::group::version-skew fingerprints"
+          grep -aE "was compiled with an incompatible version of Kotlin|Unresolved reference|Too many arguments|is too new for kotlin|Inconsistent JVM-target|Cannot access|NoSuchMethodError|OutOfMemory" "$LOG" | head -10 || true
+          echo "::endgroup::"
+
+          # Resolved versions of the Kotlin-sensitive libraries: an SDK-52 project
+          # resolving 2026-era androidx/Compose artifacts against a Kotlin 1.9 compiler
+          # is a common source of metadata errors, so record what actually resolved.
+          if [ -d mobile/android ]; then
+            DEPS="${RUNNER_TEMP:-/tmp}/deps.txt"
+            echo "::group::resolved Kotlin-sensitive dependency versions"
+            (cd mobile/android && ./gradlew :expo-modules-core:dependencies \
+              --configuration debugCompileClasspath --console=plain 2>/dev/null || true) \
+              | grep -aE "kotlin-stdlib|kotlin-reflect|kotlinx-coroutines|androidx\.core|androidx\.compose|androidx\.annotation|react-android" \
+              | sed -E 's/^[|+\\ -]+//; s/ \([^)]*\)$//' | sort -u | head -25 > "$DEPS" || true
+            cat "$DEPS"
+            echo "::endgroup::"
+            # Guarantee a trailing newline: tr eats it, and `read` discards a final
+            # line that is not newline-terminated.
+            CHUNKS="$( { tr '\n' '|' < "$DEPS"; echo; } | fold -w 800 | head -3 )" || true
+            printf '%s\n' "$CHUNKS" | while IFS= read -r chunk; do
+              [ -n "$chunk" ] && echo "::notice::resolved deps: $chunk"
+            done
+          fi
