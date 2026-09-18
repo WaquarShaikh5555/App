@@ -1,33 +1,25 @@
 name: Build APK (Preview)
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - 'mobile/**'
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node 20
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: mobile/package-lock.json
+          node-version: 22
 
-      - name: Install EAS CLI
+      - name: Install EAS
         run: npm install -g eas-cli
 
-      - name: Install mobile deps
+      - name: Install deps
         working-directory: mobile
         run: npm install
 
-      - name: Build APK on Expo cloud
+      - name: Build APK
         working-directory: mobile
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
