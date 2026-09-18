@@ -4,6 +4,11 @@
 
 > Value prop: **"Confirm COD orders before you ship them."** We do NOT guarantee fewer returns. We measure confirmation rate / cancellation rate / no-response rate; merchant compares against own historical RTO.
 
+> **Installing the app?** See **[GETTING-STARTED.md](GETTING-STARTED.md)** for the APK
+> download, how to start the backend, and how to point the app at it. The app finds the
+> backend on your Wi-Fi by itself, and the address can be changed later under
+> Settings → Server without rebuilding.
+
 Verified at build time (2026-09-17):
 - Shopify Admin API latest stable: **2026-07** (released 2026-07-01, supported until 2027-07-16)
 - Meta Graph API / WhatsApp Cloud API latest: **v26.0** (released 2026-07-29) — from https://developers.facebook.com/docs/graph-api/changelog/
@@ -131,24 +136,29 @@ MOCK_MODE=true # false in production, enables mock adapters for local dev withou
 ## Local Dev Instructions
 
 ### Backend
+No configuration is needed to try it: mock mode is the default and keeps users, orders and
+settings in memory, so it runs without Postgres and without any API keys.
 ```bash
 cd backend
-cp .env.example .env
-# edit .env, set MOCK_MODE=true for no credentials
 npm install
-npx prisma generate
-# if you have Postgres:
-npx prisma migrate dev
 npm run dev
 # health check
 curl http://localhost:3000/health
+```
+With a real database instead:
+```bash
+cp .env.example .env   # DATABASE_URL, MOCK_MODE=false, JWT secrets
+npx prisma generate
+npx prisma migrate dev
+npm run dev
 ```
 
 ### Mobile
 ```bash
 cd mobile
 npm install
-# set API URL for local dev (Android emulator uses 10.0.2.2 for host localhost)
+# the API URL is a starting default only: it can be changed at runtime under
+# Settings -> Server (persisted on the device), so a rebuild is never needed
 EXPO_PUBLIC_API_URL=http://10.0.2.2:3000 npx expo start
 # or
 npx expo start --tunnel # for physical device

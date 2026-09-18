@@ -1,14 +1,16 @@
 import axios from 'axios';
-import { API_URL } from '../utils/config';
+import { getApiUrl, hostLabel, explainConnectionFailure } from './serverConfig';
 import { getAccessToken, getRefreshToken, saveTokens, clearTokens } from './storage';
 
 const api = axios.create({
-  baseURL: `${API_URL}/api`,
   timeout: 15000,
   headers: { 'Content-Type': 'application/json' },
 });
 
+// The server address is read per request, so changing it in Settings applies immediately
+// without restarting the app.
 api.interceptors.request.use(async (config) => {
+  config.baseURL = `${getApiUrl()}/api`;
   const token = await getAccessToken();
   if (token) {
     config.headers.Authorization = `Bearer ${token}`;
@@ -20,12 +22,12 @@ api.interceptors.response.use(
   (res) => res,
   async (error) => {
     const original = error.config;
-    if (error.response?.status === 401 && !original._retry) {
+    if (error.response?.status === 401 && original && !original._retry) {
       original._retry = true;
       try {
         const refreshToken = await getRefreshToken();
         if (!refreshToken) throw new Error('No refresh token');
-        const res = await axios.post(`${API_URL}/api/auth/refresh`, { refreshToken });
+        const res = await axios.post(`${getApiUrl()}/api/auth/refresh`, { refreshToken });
         const { accessToken, refreshToken: newRefresh } = res.data;
         await saveTokens(accessToken, newRefresh);
         original.headers.Authorization = `Bearer ${accessToken}`;
@@ -40,12 +42,60 @@ api.interceptors.response.use(
   }
 );
 
+/**
+ * Turn an axios failure into something worth showing a user.
+ *
+ * The backend already returns readable messages ("Invalid credentials"), so those are passed
+ * through; everything else (no network, wrong port, 500s) becomes an explanation instead of
+ * axios' "Network Error".
+ */
+export function describeApiError(error: any): string {
+  const serverError =
+    typeof error?.response?.data?.error === 'string'
+      ? error.response.data.error
+      : typeof error?.response?.data?.message === 'string'
+        ? error.response.data.message
+        : undefined;
+
+  if (error?.response) {
+    const status = error.response.status;
+    switch (status) {
+      case 400:
+        return serverError || 'Please check the details you entered.';
+      case 401:
+        return serverError && !/invalid credentials/i.test(serverError)
+          ? serverError
+          : 'Wrong email or password.';
+      case 403:
+        return serverError || 'This account is not allowed to do that.';
+      case 409:
+        return 'That email already has an account. Sign in instead.';
+      case 429:
+        return 'Too many attempts. Wait a minute and try again.';
+      case 501:
+        return serverError || 'That sign-in method is not set up on the server yet.';
+      default:
+        if (status >= 500) {
+          return `The server had a problem (HTTP ${status}). Check the backend logs.`;
+        }
+        return serverError || `Request failed (HTTP ${status}).`;
+    }
+  }
+
+  return explainConnectionFailure(error, getApiUrl());
+}
+
+export { hostLabel };
 export default api;
 
 // Auth
 export const authApi = {
   login: (email: string, password: string) => api.post('/auth/login', { email, password }),
-  register: (email: string, password: string, name?: string, orgName?: string) => api.post('/auth/register', { email, password, name, orgName }),
+  register: (email: string, password: string, name?: string, orgName?: string) =>
+    api.post('/auth/register', { email, password, name, orgName }),
+  me: () => api.get('/auth/me'),
+  google: (idToken: string) => api.post('/auth/google', { idToken }),
+  logout: () => clearTokens(),
 };
 
 // Dashboard

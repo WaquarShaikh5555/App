@@ -5,7 +5,7 @@ import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
 import { config } from './config';
 import { logger } from './lib/logger';
-import { errorHandler } from './middleware/error';
+import { errorHandler, notFoundHandler } from './middleware/error';
 
 import authRoutes from './routes/auth';
 import shopifyRoutes from './routes/shopify';
@@ -69,6 +69,9 @@ app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/push', pushRoutes);
 app.use('/api/templates', templateRoutes);
+
+// Unknown API routes get a JSON message the app can display (not an HTML 404)
+app.use('/api', notFoundHandler);
 
 // Error handler
 app.use(errorHandler);

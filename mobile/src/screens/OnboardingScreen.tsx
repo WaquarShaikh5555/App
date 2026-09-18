@@ -2,6 +2,8 @@ import React from 'react';
 import { View, Text, Button, StyleSheet } from 'react-native';
 
 export default function OnboardingScreen({ navigation }: any) {
+  // Reachable both before and after signing in; only the signed-in navigator has these routes.
+  const signedIn = navigation.getState?.().routeNames?.includes('MainTabs') ?? false;
   return (
     <View style={styles.container}>
       <Text style={styles.title}>Welcome to OrderConfirm</Text>
@@ -11,9 +13,19 @@ export default function OnboardingScreen({ navigation }: any) {
       <Text style={styles.bullet}>3. We auto-send confirmation requests for COD orders</Text>
       <Text style={styles.bullet}>4. Customer confirms/cancels in WhatsApp</Text>
       <Text style={styles.note}>We never guarantee fewer returns. We help you confirm intent before shipping. You measure RTO vs your own history.</Text>
-      <Button title="Connect Shopify" onPress={() => navigation.navigate('ConnectShopify')} />
-      <View style={{ height: 10 }} />
-      <Button title="Go to Dashboard" onPress={() => navigation.navigate('MainTabs')} />
+      {signedIn ? (
+        <>
+          <Button title="Connect Shopify" onPress={() => navigation.navigate('ConnectShopify')} />
+          <View style={{ height: 10 }} />
+          <Button title="Go to Dashboard" onPress={() => navigation.navigate('MainTabs')} />
+        </>
+      ) : (
+        <>
+          <Button title="Sign in to get started" onPress={() => navigation.navigate('Login')} />
+          <View style={{ height: 10 }} />
+          <Button title="Create an account" onPress={() => navigation.navigate('Register')} />
+        </>
+      )}
     </View>
   );
 }

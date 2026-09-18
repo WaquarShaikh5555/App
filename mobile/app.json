@@ -31,7 +31,8 @@
         "android.permission.INTERNET",
         "android.permission.POST_NOTIFICATIONS"
       ],
-      "useNextNotificationsApi": true
+      "useNextNotificationsApi": true,
+      "usesCleartextTraffic": true
     },
     "web": {
       "favicon": "./assets/favicon.png"
@@ -52,7 +53,12 @@
       "eas": {
         "projectId": "orderconfirm-merchant-project"
       },
-      "apiUrl": "http://localhost:3000"
+      "apiUrl": "http://localhost:3000",
+      "googleAuth": {
+        "webClientId": "",
+        "androidClientId": "",
+        "iosClientId": ""
+      }
     }
   }
 }

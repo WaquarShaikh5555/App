@@ -21,6 +21,14 @@ export const config = {
     apiVersion: process.env.WHATSAPP_API_VERSION || 'v26.0', // verified latest Graph API v26.0 released 2026-07-29
     verifyToken: process.env.WHATSAPP_VERIFY_TOKEN || 'orderconfirm_verify_token',
   },
+  google: {
+    // Comma-separated list of accepted OAuth client IDs (web, Android, iOS).
+    // An ID token is only accepted if its `aud` is one of these.
+    clientIds: (process.env.GOOGLE_CLIENT_ID || '')
+      .split(',')
+      .map((id) => id.trim())
+      .filter(Boolean),
+  },
   backendUrl: process.env.BACKEND_URL || 'http://localhost:3000',
   frontendUrl: process.env.FRONTEND_URL || 'exp://localhost:19000',
   mockMode: (process.env.MOCK_MODE || 'true') === 'true',

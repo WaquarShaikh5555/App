@@ -1,52 +1,535 @@
-name: Build APK Local
+name: Build Android APK
+
+# Builds a debug APK with the local Android toolchain (no EAS cloud service).
+#
+# The committed state cannot build as-is, so this workflow repairs it first:
+#
+#  1. mobile/package.json sets "main": "expo-router/entry", but expo-router is not
+#     installed and there is no app/ directory. Expo's Android template resolves the
+#     entry point by shelling out to Node *while Gradle configures* the project:
+#
+#         entryFile = file(["node", "-e", "require('expo/scripts/resolveAppEntry')",
+#                           projectRoot, "android", "absolute"].execute(null, rootDir).text.trim())
+#
+#     List.execute() captures stdout only, so when the Node helper exits 1 with a
+#     ConfigError (ENTRY_NOT_FOUND) the expression becomes file('') and Gradle dies
+#     at android/app/build.gradle line 12 with `path=''`. Fixing `main` is not enough
+#     on its own: pointing it straight at App.tsx bundles fine but never calls
+#     registerRootComponent(), so the APK crashes with "main has not been registered".
+#     This workflow therefore writes a one-line index.js shim and points `main` at it.
+#
+#  2. All five PNGs in mobile/assets/ are 68-byte 1x1 stubs. Real 1024px (etc.)
+#     artwork is generated with Pillow and verified before prebuild turns it into
+#     launcher/splash/notification resources.
+#
+#  3. Prebuild's generated `react { }` block resolves reactNativeDir, hermesCommand,
+#     codegenDir and cliFile by executing Node during Gradle *configuration* too - four
+#     more subprocess calls whose stdout must resolve. .github/scripts/patch-react-gradle.py
+#     rewrites all five properties to static paths, checks every path on disk, and fails
+#     fast if it cannot (before Gradle runs). The remaining `require.resolve(...)` calls in
+#     android/settings.gradle and android/build.gradle are left alone on purpose: they
+#     resolve *installed* packages rather than the app entry, so they succeed once
+#     node_modules exists - which is why the original failure surfaced at app/build.gradle
+#     line 12 and not earlier.
+
 on:
   workflow_dispatch:
+    inputs:
+      api_url:
+        description: 'Backend URL the app should talk to (optional; defaults to the value in app.json)'
+        required: false
+        default: ''
+        type: string
+  push:
+    branches:
+      - main
+      # While this change is under review, let the branch build itself on every push so
+      # results are verifiable without dispatching manually. Drop this line after merge.
+      - arena/01a0b30b-app
+    paths:
+      - 'mobile/**'
+      - '.github/workflows/eas-build.yml'
+      - '.github/scripts/**'
+
+permissions:
+  contents: write   # needed to publish the APK as a release asset
+
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # expo prebuild --non-interactive is deprecated; CI=1 is the supported switch.
+  CI: '1'
+  EXPO_NO_TELEMETRY: '1'
 
 jobs:
   build:
+    name: Build installable APK
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: 22 }
-      - uses: actions/setup-java@v4
-        with: { distribution: temurin, java-version: 17 }
+      - name: Checkout
+        uses: actions/checkout@v7
 
-      - name: Install deps
-        working-directory: mobile
-        run: npm install
+      # Print exactly what is being built, so any log can be attributed to a revision.
+      - name: Job context
+        run: |
+          echo "ref        : ${GITHUB_REF} (${GITHUB_REF_NAME})"
+          echo "commit     : ${GITHUB_SHA}"
+          git log -1 --pretty='subject    : %s' || true
+          echo "workflow   : $(sha256sum .github/workflows/eas-build.yml | cut -c1-16) (sha256, first 16)"
+          node -p "const p=require('./mobile/package.json'); JSON.stringify({main:p.main, expo:p.dependencies.expo, 'react-native':p.dependencies['react-native'], 'react-native-screens':p.dependencies['react-native-screens']}, null, 1)" || true
+          echo "assets     :"; ls -l mobile/assets || true
 
-      - name: Fix icons
+      - name: Set up Node 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      # mobile/ has no lockfile, so caching is keyed on package.json.
+      - name: Cache npm downloads
+        uses: actions/cache@v6
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ hashFiles('mobile/package.json') }}
+          restore-keys: npm-${{ runner.os }}-
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      # --- 1. entry point -------------------------------------------------
+      - name: Fix the JavaScript entry point
         working-directory: mobile
         run: |
-          pip install Pillow
-          python3 -c "from PIL import Image; i=Image.new('RGB',(1024,1024),color=(37,211,102)); i.save('assets/icon.png'); i.save('assets/adaptive-icon.png'); j=Image.new('RGB',(1284,2778),color=(255,255,255)); j.save('assets/splash.png'); k=Image.new('RGB',(96,96),color=(37,211,102)); k.save('assets/notification-icon.png'); k.save('assets/favicon.png')"
+          node <<'NODE'
+          const fs = require('fs');
 
-      - name: Prebuild
+          const EXTENSIONS = ['', '.tsx', '.ts', '.jsx', '.js'];
+          const COMPONENTS = ['App.tsx', 'App.ts', 'App.jsx', 'App.js', 'src/App.tsx', 'src/App.jsx'];
+          const REGISTERS_ROOT = /registerRootComponent|registerComponent\s*\(/;
+
+          const resolveMain = (main) => {
+            if (!main) return null;
+            for (const base of [main, `node_modules/${main}`]) {
+              for (const ext of EXTENSIONS) {
+                const candidate = base + ext;
+                if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate;
+              }
+            }
+            return null;
+          };
+
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          const current = resolveMain(pkg.main);
+
+          if (current && REGISTERS_ROOT.test(fs.readFileSync(current, 'utf8'))) {
+            console.log(`Entry point already correct: main=${JSON.stringify(pkg.main)} -> ${current}`);
+            process.exit(0);
+          }
+
+          console.log(`package.json main = ${JSON.stringify(pkg.main)}`);
+          console.log(current
+            ? `  ...resolves to ${current}, which never calls registerRootComponent()`
+            : '  ...does not resolve to any file');
+
+          const component = COMPONENTS.find((file) => fs.existsSync(file));
+          if (!component) {
+            console.error(`::error::none of ${COMPONENTS.join(', ')} exists - cannot create an entry point`);
+            process.exit(1);
+          }
+
+          const specifier = './' + component.replace(/\.(tsx|ts|jsx|js)$/, '');
+          fs.writeFileSync(
+            'index.js',
+            `import { registerRootComponent } from 'expo';\n\nimport App from '${specifier}';\n\nregisterRootComponent(App);\n`,
+          );
+
+          pkg.main = 'index.js';
+          fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          console.log(`Wrote index.js (imports ${specifier}) and set main = "index.js"`);
+          NODE
+
+          echo "--- package.json ---"
+          node -p "JSON.stringify({name: require('./package.json').name, main: require('./package.json').main})"
+          if [ -f index.js ]; then
+            echo "--- index.js ---"
+            cat index.js
+          else
+            echo "--- index.js ---"
+            echo "(not needed: the existing entry point already registers the root component)"
+          fi
+
+      # --- 2. icons -------------------------------------------------------
+      - name: Install Pillow
+        run: python -m pip install --disable-pip-version-check pillow
+
+      - name: Generate real app assets
+        run: python .github/scripts/gen-icons.py mobile/assets
+
+      - name: Verify assets are not placeholders
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+
+          from PIL import Image
+
+          required = ["icon.png", "adaptive-icon.png", "splash.png", "notification-icon.png", "favicon.png"]
+          failures = []
+          for name in required:
+              path = os.path.join("mobile", "assets", name)
+              if not os.path.exists(path):
+                  failures.append(f"{name}: missing")
+                  continue
+              with Image.open(path) as img:
+                  size = os.path.getsize(path)
+                  print(f"  {name:<22} {img.size[0]}x{img.size[1]:<6} {img.mode:<5} {size:,} bytes")
+                  if min(img.size) < 48:
+                      failures.append(f"{name}: {img.size[0]}x{img.size[1]} is still a placeholder")
+          if failures:
+              print("::error::placeholder assets remain: " + "; ".join(failures))
+              sys.exit(1)
+          PY
+
+      # --- 3. dependencies ------------------------------------------------
+      - name: Install dependencies
         working-directory: mobile
-        run: npx expo prebuild --platform android --non-interactive --no-install --clean
+        run: npm install --no-audit --no-fund
 
-      - name: Patch build.gradle - fix path='' bug
+      # Expo SDK 52 supports specific versions of the packages it manages, and the
+      # react-native version matters for more than the JS runtime: React Native's Gradle
+      # version catalog pins the Kotlin compiler, and expo-modules-core derives its Compose
+      # Compiler version from that Kotlin version. A react-native that is off the SDK's
+      # supported version therefore fails the Kotlin compile with
+      # "This version (1.5.15) of the Compose Compiler requires Kotlin version 1.9.25
+      #  but you appear to be using Kotlin version 1.9.24".
+      # bundledNativeModules.json ships inside the expo package, so this needs no Expo API
+      # call (same semantics as `npx expo install --fix`).
+      - name: Align dependency versions with the Expo SDK
+        run: |
+          python .github/scripts/align-expo-versions.py --project-root mobile | tee "${RUNNER_TEMP:-/tmp}/align.log"
+          if grep -q "are off the Expo SDK" "${RUNNER_TEMP:-/tmp}/align.log"; then
+            echo "Reinstalling so the aligned versions take effect"
+            (cd mobile && npm install --no-audit --no-fund)
+          fi
+
+      # expo depends on expo-asset, but with no lockfile npm can install it nested at
+      # node_modules/expo/node_modules/expo-asset rather than hoisting it. @expo/metro-config
+      # resolves 'expo-asset/tools/hashAssetFiles' *from the project root*
+      # (resolveFrom.silent(projectRoot, ...)), so bundling then dies with
+      # "The required package `expo-asset` cannot be found". A direct dependency is always
+      # placed at the top level. The range is read from the installed expo package, so this
+      # needs no Expo API call and cannot drift from the SDK's expected version.
+      - name: Ensure expo-asset resolves from the project root
         working-directory: mobile
         run: |
-          echo "Before patch line 12:"
-          sed -n '1,20p' android/app/build.gradle
-          # Replace the dynamic node resolve with static path
-          sed -i "s|def reactNativeDir =.*|def reactNativeDir = new File(rootDir, \"../node_modules/react-native\").getAbsolutePath()|" android/app/build.gradle
-          echo "After patch:"
-          sed -n '1,20p' android/app/build.gradle
-          # Also ensure react-native exists
-          ls -la node_modules/react-native/package.json
+          if node -e "require.resolve('expo-asset/tools/hashAssetFiles')" 2>/dev/null; then
+            echo "expo-asset already resolves from the project root"
+          else
+            RANGE="$(node -p "require('expo/package.json').dependencies['expo-asset'] || ''")"
+            if [ -z "$RANGE" ]; then
+              echo "::error::the installed expo package does not declare expo-asset"
+              exit 1
+            fi
+            echo "expo-asset was only reachable as a nested dependency; installing expo-asset@${RANGE}"
+            npm install "expo-asset@${RANGE}" --no-audit --no-fund
+            node -e "require.resolve('expo-asset/tools/hashAssetFiles')"
+          fi
 
-      - name: Accept licenses
-        run: yes | sdkmanager --licenses || true
+      # Fail fast on entry point / module graph problems, before Gradle runs.
+      - name: Verify Expo can resolve the entry point
+        working-directory: mobile
+        run: |
+          entry="$(node -e "require('expo/scripts/resolveAppEntry')" "$PWD" android absolute)"
+          echo "resolveAppEntry -> '${entry}'"
+          if [ -z "$entry" ]; then
+            echo "::error::resolveAppEntry returned an empty path; Gradle would fail with path=''"
+            exit 1
+          fi
+          test -f "$entry" || { echo "::error::$entry does not exist"; exit 1; }
 
-      - name: Build APK
+      - name: Smoke test the JavaScript bundle
+        working-directory: mobile
+        run: npx expo export --platform android --output-dir "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/expo-export"
+
+      # --- 4. native project ---------------------------------------------
+      - name: Prebuild the Android project
+        working-directory: mobile
+        run: npx expo prebuild --platform android --clean --no-install
+
+      - name: Patch react block to static paths
+        run: python .github/scripts/patch-react-gradle.py --project-root mobile
+
+      # Three files from three packages decide which Kotlin and Compose Compiler this
+      # build uses: React Native's version catalog (the Kotlin plugin), the kotlinVersion
+      # that prebuild wrote into android/build.gradle (which Expo modules read), and
+      # expo-modules-core's Kotlin -> Compose Compiler map. If they disagree, Gradle fails
+      # several minutes in with "Compose Compiler requires Kotlin version X". --fix makes
+      # the two numbers agree (pinning android.kotlinVersion to the version the Kotlin
+      # plugin actually applies), then the check re-runs to prove the pairing is safe -
+      # all offline, in milliseconds, before any Gradle task starts.
+      - name: Verify the Kotlin toolchain agrees
+        run: |
+          python .github/scripts/verify-kotlin-toolchain.py --project-root mobile --fix
+          python .github/scripts/verify-kotlin-toolchain.py --project-root mobile
+
+      # --- 5. build -------------------------------------------------------
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android SDK packages
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+          sdkmanager --install "ndk;26.1.10909125" || echo "::warning::NDK not pre-installed; AGP may fetch it on demand"
+          sdkmanager --install "cmake;3.22.1" || echo "::warning::cmake not pre-installed; AGP may fetch it on demand"
+          sdkmanager --list_installed | sed -n '1,25p'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      # assembleRelease, not assembleDebug: a debug APK contains no JavaScript and can
+      # only run against a Metro dev server. The release build runs `expo export:embed`
+      # through Gradle and packs the Hermes bytecode plus assets into the APK, so the
+      # result installs and opens on its own. The Expo template signs release builds
+      # with the debug keystore, so it installs without any signing setup. The
+      # keystore is the one checked into expo-template-bare-minimum (android/app/debug.keystore),
+      # so the signature is identical on every run and a new APK installs straight over the
+      # previous one. Its certificate SHA-1 is printed in the step summary, and is the value
+      # to register if Google sign-in is set up.
+      - name: Build installable APK
         working-directory: mobile/android
-        run: ./gradlew assembleDebug --no-daemon --stacktrace
+        env:
+          # Baked into the JS bundle at build time (see app.config.js).
+          EXPO_PUBLIC_API_URL: ${{ inputs.api_url }}
+        run: |
+          chmod +x gradlew
+          set -o pipefail
+          # tee so the Diagnostics step can extract compiler errors from the log
+          # (Kotlin reports diagnostics on their own "e:" lines).
+          ./gradlew assembleRelease --no-daemon --stacktrace --console=plain 2>&1 \
+            | tee "${RUNNER_TEMP:-/tmp}/gradle-build.log"
 
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
+      # --- 6. verify + publish -------------------------------------------
+      - name: Verify the APK
+        id: apk
+        run: |
+          APK="mobile/android/app/build/outputs/apk/release/app-release.apk"
+          test -f "$APK" || { echo "::error::$APK was not produced"; exit 1; }
+
+          unzip -l "$APK" | grep -q "AndroidManifest.xml" || { echo "::error::manifest missing from APK"; exit 1; }
+          unzip -l "$APK" | grep -q "classes.dex" || { echo "::error::classes.dex missing from APK"; exit 1; }
+
+          # The point of a release build: the JavaScript is inside the APK, so the app
+          # launches without a dev server. Without this the APK is uninstallable-in-practice.
+          if ! unzip -l "$APK" | grep -qE "assets/(index\.android\.bundle|.*\.hbc)"; then
+            echo "::error::no JavaScript bundle inside the APK - it would require the Metro dev server"
+            unzip -l "$APK" | grep -i "assets/" | head -20 || true
+            exit 1
+          fi
+          echo "bundled JS inside APK:"
+          unzip -l "$APK" | grep -E "assets/(index\.android\.bundle|.*\.hbc)" | head -5
+
+          SIZE_BYTES=$(stat -c %s "$APK")
+          if [ "$SIZE_BYTES" -lt 1000000 ]; then
+            echo "::error::APK is suspiciously small ($SIZE_BYTES bytes)"
+            exit 1
+          fi
+
+          SHA=$(sha256sum "$APK" | cut -d' ' -f1)
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "size=$(du -h "$APK" | cut -f1)" >> "$GITHUB_OUTPUT"
+          echo "url=https://github.com/${GITHUB_REPOSITORY}/releases/download/apk-latest/OrderConfirm-release.apk" >> "$GITHUB_OUTPUT"
+
+          echo "--- APK contents (first 20 entries) ---"
+          unzip -l "$APK" | sed -n '1,20p'
+          echo "--- package / launchable activity ---"
+          AAPT="$(ls "$ANDROID_HOME"/build-tools/*/aapt2 2>/dev/null | tail -1 || true)"
+          if [ -n "$AAPT" ]; then
+            "$AAPT" dump badging "$APK" | grep -E "^package|launchable-activity" || true
+          fi
+
+          {
+            echo "### Installable APK built"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| size | $(du -h "$APK" | cut -f1) |"
+            echo "| sha256 | \`$SHA\` |"
+            echo "| built from | \`${GITHUB_SHA}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Everything needed to set up Google sign-in, printed where it can be copied.
+          PACKAGE_NAME="com.orderconfirm.merchant"
+          SIGNER_SHA1=""
+          APKSIGNER="$(ls "$ANDROID_HOME"/build-tools/*/apksigner 2>/dev/null | tail -1 || true)"
+          if [ -n "$APKSIGNER" ]; then
+            SIGNER_SHA1=$("$APKSIGNER" verify --print-certs "$APK" 2>/dev/null \
+              | grep -i "SHA-1 certificate digest" | head -1 | sed 's/.*: //' || true)
+          fi
+          echo "--- Google sign-in facts ---"
+          echo "package name : $PACKAGE_NAME"
+          echo "redirect URI : ${PACKAGE_NAME}:/oauthredirect"
+          echo "signer SHA-1 : ${SIGNER_SHA1:-(unavailable)}"
+          {
+            echo ""
+            echo "<details><summary>Google sign-in setup</summary>"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| package name | \`$PACKAGE_NAME\` |"
+            echo "| redirect URI | \`${PACKAGE_NAME}:/oauthredirect\` |"
+            echo "| signing SHA-1 | \`${SIGNER_SHA1:-(unavailable)}\` |"
+            echo ""
+            echo "This build is signed with an automatically generated debug keystore, so the"
+            echo "SHA-1 above is only valid for this keystore. Google sign-in stays hidden until"
+            echo "client IDs are set in \`mobile/app.json\` (expo.extra.googleAuth) and"
+            echo "\`GOOGLE_CLIENT_ID\` is set on the backend."
+            echo ""
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload APK as build artifact
+        uses: actions/upload-artifact@v7
         with:
           name: OrderConfirm-APK
-          path: mobile/android/app/build/outputs/apk/debug/app-debug.apk
+          path: mobile/android/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      # A permanent download link, so the APK does not have to be hunted for in the
+      # Actions UI and survives the artifact expiry window.
+      - name: Publish APK as a release download
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          APK="${{ steps.apk.outputs.path }}"
+          # Publish under a readable name, so the download URL is predictable.
+          cp "$APK" OrderConfirm-release.apk
+          gh release delete apk-latest --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+          NOTES="Installable Android build (JavaScript bundled in, no dev server needed)."$'\n\n'
+          NOTES+="- built from commit ${GITHUB_SHA}"$'\n'
+          NOTES+="- sha256 ${{ steps.apk.outputs.sha }}"$'\n'
+          NOTES+="- size ${{ steps.apk.outputs.size }}"$'\n\n'
+          NOTES+="Download the .apk and open it on the phone; allow installing from unknown sources."
+          gh release create apk-latest OrderConfirm-release.apk \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "OrderConfirm APK (latest build)" \
+            --notes "$NOTES" \
+            --latest || echo "::warning::could not publish the release asset; use the OrderConfirm-APK artifact from this run instead"
+
+          {
+            echo ""
+            echo "**Download:** ${{ steps.apk.outputs.url }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          echo "::group::package.json main"
+          node -p "require('./mobile/package.json').main" || true
+          echo "::endgroup::"
+
+          if [ -f mobile/index.js ]; then
+            echo "::group::mobile/index.js"
+            cat mobile/index.js
+            echo "::endgroup::"
+          fi
+
+          if [ -f mobile/android/app/build.gradle ]; then
+            echo "::group::react block in android/app/build.gradle"
+            sed -n '/^react {/,/^}/p' mobile/android/app/build.gradle
+            echo "::endgroup::"
+          fi
+
+          echo "::group::entry point resolution"
+          (cd mobile && node -e "require('expo/scripts/resolveAppEntry')" "$PWD" android absolute) || true
+          echo "::endgroup::"
+
+          LOG="${RUNNER_TEMP:-/tmp}/gradle-build.log"
+          if [ ! -f "$LOG" ]; then
+            echo "no Gradle log at $LOG"
+            exit 0
+          fi
+
+          echo "::group::failing tasks"
+          grep -aE "^> Task .*FAILED|^FAILURE:|^BUILD FAILED" "$LOG" | head -10 || true
+          echo "::endgroup::"
+          while IFS= read -r line; do
+            echo "::error::$(printf '%s' "$line" | cut -c1-900)"
+          done < <(grep -aE "^> Task .*FAILED|^BUILD FAILED" "$LOG" | head -4 || true)
+
+          # "What went wrong" is the most informative part of any Gradle failure, so
+          # surface it as annotations even when there is no Kotlin diagnostic.
+          WHAT="$(awk '/^\* What went wrong:/{f=1;next} /^\* Try:/{f=0} f' "$LOG" | sed '/^[[:space:]]*$/d' | head -12 || true)"
+          if [ -n "$WHAT" ]; then
+            echo "::group::what went wrong"
+            printf '%s\n' "$WHAT"
+            echo "::endgroup::"
+            while IFS= read -r line; do
+              echo "::error::$(printf '%s' "$line" | cut -c1-900)"
+            done < <(printf '%s\n' "$WHAT" | head -5)
+          fi
+
+          # Non-Gradle errors (the Expo CLI / Node faulter the bundle step, for example).
+          NODEERR="$(grep -aE "^(Error|error): |Command failed: |No such file or directory|EACCES|ENOSPC|OutOfMemoryError|Lint found" "$LOG" | sort -u | head -8 || true)"
+          if [ -n "$NODEERR" ]; then
+            echo "::group::other errors"
+            printf '%s\n' "$NODEERR"
+            echo "::endgroup::"
+            while IFS= read -r line; do
+              echo "::error::$(printf '%s' "$line" | cut -c1-900)"
+            done < <(printf '%s\n' "$NODEERR" | head -4)
+          fi
+
+          # Last resort: the tail of the log, so a novel failure still reports something.
+          TAIL="$(grep -avE "^\s*$" "$LOG" | tail -8 | tr '\n' '~' | cut -c1-900 || true)"
+          if [ -n "$TAIL" ]; then echo "::notice::log tail: $TAIL"; fi
+
+          # Kotlin diagnostics. These are emitted as annotations so they are readable
+          # from the Actions UI (and from the API) without downloading the log.
+          echo "::group::Kotlin diagnostics"
+          grep -aE "^(e|w): " "$LOG" | head -12 || true
+          echo "::endgroup::"
+          while IFS= read -r line; do
+            echo "::error::$(printf '%s' "$line" | cut -c1-900)"
+          done < <(grep -aE "^e: " "$LOG" | head -5 || true)
+
+          # Version-skew fingerprints worth seeing even when the e: lines are terse.
+          echo "::group::version-skew fingerprints"
+          grep -aE "was compiled with an incompatible version of Kotlin|Unresolved reference|Too many arguments|is too new for kotlin|Inconsistent JVM-target|Cannot access|NoSuchMethodError|OutOfMemory" "$LOG" | head -10 || true
+          echo "::endgroup::"
+
+          # Resolved versions of the Kotlin-sensitive libraries: an SDK-52 project
+          # resolving 2026-era androidx/Compose artifacts against a Kotlin 1.9 compiler
+          # is a common source of metadata errors, so record what actually resolved.
+          if [ -d mobile/android ]; then
+            DEPS="${RUNNER_TEMP:-/tmp}/deps.txt"
+            echo "::group::resolved Kotlin-sensitive dependency versions"
+            (cd mobile/android && ./gradlew :expo-modules-core:dependencies \
+              --configuration debugCompileClasspath --console=plain 2>/dev/null || true) \
+              | grep -aE "kotlin-stdlib|kotlin-reflect|kotlinx-coroutines|androidx\.core|androidx\.compose|androidx\.annotation|react-android" \
+              | sed -E 's/^[|+\\ -]+//; s/ \([^)]*\)$//' | sort -u | head -25 > "$DEPS" || true
+            cat "$DEPS"
+            echo "::endgroup::"
+            # Guarantee a trailing newline: tr eats it, and `read` discards a final
+            # line that is not newline-terminated.
+            CHUNKS="$( { tr '\n' '|' < "$DEPS"; echo; } | fold -w 800 | head -3 || true)"
+            while IFS= read -r chunk; do
+              if [ -n "$chunk" ]; then echo "::notice::resolved deps: $chunk"; fi
+            done < <(printf '%s\n' "$CHUNKS")
+          fi
+
+          # Diagnostics must never fail the job on its own.
+          true
