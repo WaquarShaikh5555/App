@@ -7,47 +7,43 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
+        with: { node-version: 22 }
       - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 17
+        with: { distribution: temurin, java-version: 17 }
 
       - name: Install deps
         working-directory: mobile
         run: npm install
 
-      - name: Generate valid icons (fix 68-byte placeholder)
+      - name: Fix icons
         working-directory: mobile
         run: |
           pip install Pillow
-          python3 -c "
-          from PIL import Image
-          img=Image.new('RGB',(1024,1024),color=(37,211,102))
-          img.save('assets/icon.png')
-          img.save('assets/adaptive-icon.png')
-          img2=Image.new('RGB',(1284,2778),color=(255,255,255))
-          img2.save('assets/splash.png')
-          img3=Image.new('RGB',(96,96),color=(37,211,102))
-          img3.save('assets/notification-icon.png')
-          img3.save('assets/favicon.png')
-          print('Icons generated')
-          "
+          python3 -c "from PIL import Image; i=Image.new('RGB',(1024,1024),color=(37,211,102)); i.save('assets/icon.png'); i.save('assets/adaptive-icon.png'); j=Image.new('RGB',(1284,2778),color=(255,255,255)); j.save('assets/splash.png'); k=Image.new('RGB',(96,96),color=(37,211,102)); k.save('assets/notification-icon.png'); k.save('assets/favicon.png')"
 
-      - name: Prebuild Android
+      - name: Prebuild
         working-directory: mobile
         run: npx expo prebuild --platform android --non-interactive --no-install --clean
+
+      - name: Patch build.gradle - fix path='' bug
+        working-directory: mobile
+        run: |
+          echo "Before patch line 12:"
+          sed -n '1,20p' android/app/build.gradle
+          # Replace the dynamic node resolve with static path
+          sed -i "s|def reactNativeDir =.*|def reactNativeDir = new File(rootDir, \"../node_modules/react-native\").getAbsolutePath()|" android/app/build.gradle
+          echo "After patch:"
+          sed -n '1,20p' android/app/build.gradle
+          # Also ensure react-native exists
+          ls -la node_modules/react-native/package.json
 
       - name: Accept licenses
         run: yes | sdkmanager --licenses || true
 
       - name: Build APK
         working-directory: mobile/android
-        run: ./gradlew assembleDebug --no-daemon
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
