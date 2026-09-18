@@ -1,4 +1,4 @@
-name: Build APK (Preview)
+name: Build APK Local
 on:
   workflow_dispatch:
 
@@ -12,15 +12,28 @@ jobs:
         with:
           node-version: 22
 
-      - name: Install EAS
-        run: npm install -g eas-cli
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
 
       - name: Install deps
         working-directory: mobile
         run: npm install
 
-      - name: Build APK
+      - name: Prebuild Android
         working-directory: mobile
-        env:
-          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
-        run: eas build -p android --profile preview --non-interactive --no-wait
+        run: npx expo prebuild --platform android --non-interactive --no-install
+
+      - name: Build APK
+        working-directory: mobile/android
+        run: ./gradlew assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: OrderConfirm-APK
+          path: mobile/android/app/build/outputs/apk/debug/app-debug.apk
